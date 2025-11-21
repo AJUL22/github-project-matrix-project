@@ -1,11 +1,14 @@
-name: Build & Push per-arch
+name: Build & Push per-arch (hardened)
 
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
 
-# allow GHCR writes using the GITHUB_TOKEN
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: false   # keep old runs; set true to cancel old runs instead
+
 permissions:
   contents: read
   packages: write
@@ -19,6 +22,7 @@ env:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       matrix:
         arch: [ amd64, arm64 ]
@@ -26,26 +30,74 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up QEMU (for cross-building)
+      - name: Debug - runner info
+        run: |
+          echo "RUNNER: $RUNNER_OS $RUNNER_NAME"
+          uname -a
+          docker --version
+
+      - name: Set up QEMU
         uses: docker/setup-qemu-action@v2
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
 
-      # Login step: Docker Hub for amd64, GHCR for arm64
-      - name: Login to target registry
+      - name: Login to registry
         uses: docker/login-action@v2
         with:
           registry: ${{ matrix.arch == 'arm64' && 'ghcr.io' || 'docker.io' }}
           username: ${{ matrix.arch == 'arm64' && github.actor || secrets.DOCKERHUB_USERNAME }}
           password: ${{ matrix.arch == 'arm64' && secrets.GITHUB_TOKEN || secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push image (arch=${{ matrix.arch }})
-        uses: docker/build-push-action@v4
+      - name: Build image (with retry)
+        run: |
+          set -e
+          retry() {
+            n=0
+            until [ $n -ge 3 ]; do
+              docker build --platform=${PLATFORM} -t "${IMAGE}:${TAG}" . && break
+              n=$((n+1))
+              echo "Build retry $n..."
+              sleep $((5 * n))
+            done
+            if [ $n -ge 3 ]; then
+              echo "Build failed after retries" && exit 1
+            fi
+          }
+          PLATFORM=${{ matrix.arch == 'amd64' && 'linux/amd64' || 'linux/arm64' }}
+          IMAGE=${{ matrix.arch == 'amd64' && env.IMAGE_NAME_AMD || env.IMAGE_NAME_ARM }}
+          TAG=${{ env.TAG }}
+          retry
+
+      - name: Save image tar (debug artifact)
+        run: |
+          IMAGE=${{ matrix.arch == 'amd64' && env.IMAGE_NAME_AMD || env.IMAGE_NAME_ARM }}:${{ env.TAG }}
+          docker save $IMAGE -o image-${{ matrix.arch }}.tar
+        continue-on-error: false
+
+      - name: Upload build artifact for debugging
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          context: .
-          push: true
-          platforms: ${{ matrix.arch == 'amd64' && 'linux/amd64' || 'linux/arm64' }}
-          tags: |
-            ${{ matrix.arch == 'amd64' && env.IMAGE_NAME_AMD || env.IMAGE_NAME_ARM }}:${{ env.TAG }}
-            ${{ matrix.arch == 'amd64' && env.IMAGE_NAME_AMD || env.IMAGE_NAME_ARM }}:${{ env.LATEST_TAG }}
+          name: built-image-${{ matrix.arch }}
+          path: image-${{ matrix.arch }}.tar
+
+      - name: Push image (with retry)
+        run: |
+          set -e
+          retry() {
+            n=0
+            until [ $n -ge 3 ]; do
+              docker push "$1" && break
+              n=$((n+1))
+              echo "Push retry $n..."
+              sleep $((5 * n))
+            done
+            if [ $n -ge 3 ]; then
+              echo "Push failed after retries" && exit 1
+            fi
+          }
+          IMAGE=${{ matrix.arch == 'amd64' && env.IMAGE_NAME_AMD || env.IMAGE_NAME_ARM }}
+          TAG=${{ env.TAG }}
+          retry "${IMAGE}:${TAG}"
+          retry "${IMAGE}:${{ env.LATEST_TAG }}"
